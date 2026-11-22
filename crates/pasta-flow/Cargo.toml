@@ -1,0 +1,16 @@
+[package]
+name = "pasta-flow"
+description = "2D die-flow finite elements: exit-speed map, centre-line profiles and readouts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pasta-die.workspace = true
+pasta-linalg.workspace = true
+rayon.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

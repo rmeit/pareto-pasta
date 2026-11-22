@@ -1,0 +1,23 @@
+[package]
+name = "pasta-sim"
+description = "Pipeline from die to pasta: project files, background jobs, sweeps and exports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pasta-die.workspace = true
+pasta-flow.workspace = true
+pasta-shell.workspace = true
+arc-swap.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ron.workspace = true
+
+[dev-dependencies]
+rayon.workspace = true
+
+[lints]
+workspace = true

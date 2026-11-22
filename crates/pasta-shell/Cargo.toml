@@ -1,0 +1,16 @@
+[package]
+name = "pasta-shell"
+description = "Growing thin elastic shell: the pasta sheet extruded from the die"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pasta-linalg.workspace = true
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
