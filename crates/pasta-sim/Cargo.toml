@@ -10,6 +10,7 @@ rust-version.workspace = true
 pasta-die.workspace = true
 pasta-flow.workspace = true
 pasta-shell.workspace = true
+pasta-solid.workspace = true
 arc-swap.workspace = true
 rayon.workspace = true
 serde.workspace = true

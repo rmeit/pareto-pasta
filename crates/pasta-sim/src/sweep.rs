@@ -1,6 +1,6 @@
 //! Parameter sweeps: one run per core, each run single-threaded.
 
-use crate::project::{DriveSpec, MeshQuality, Project, RunReport, run_shell, solve_die};
+use crate::project::{DriveSpec, MeshQuality, Project, RunReport, run_solid, solve_die};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -49,16 +49,21 @@ pub fn apply_param(p: &mut Project, name: &str, v: f64) -> Result<(), String> {
         "pressure" => p.drive = DriveSpec::Pressure { kpa: v },
         "swell" => p.swell = v,
         "ruffle_c" => p.ruffle_c = v,
-        "young" => p.shell.young_kpa = v,
-        "poisson" => p.shell.poisson = v,
-        "density" => p.shell.density = v,
-        "stations" => p.shell.stations = v as usize,
-        "cut" => p.shell.cut_length = v,
-        "creep" => p.shell.creep_time = if v > 0.0 { Some(v) } else { None },
-        "seed" => p.shell.seed = v as u64,
+        "young" => p.solid.young_kpa = v,
+        "poisson" => p.solid.poisson = v,
+        "density" => {
+            p.solid.density = v;
+            p.shell.density = v;
+        }
+        "cells" => p.solid.cells_across = (v as usize).max(1),
+        "element" => p.solid.station_aspect = v,
+        "row" => p.solid.row_aspect = v,
+        "cut" => p.solid.cut_length = v,
+        "seed" => p.solid.seed = v as u64,
+        "gap_average" => p.solid.gap_average = v != 0.0,
         _ => {
             return Err(format!(
-                "unknown parameter {name}; use one of n, k, tau_y, beta, m, no_slip, output, pressure, swell, ruffle_c, young, poisson, density, stations, cut, creep, seed"
+                "unknown parameter {name}; use one of n, k, tau_y, beta, m, no_slip, output, pressure, swell, ruffle_c, young, poisson, density, cells, element, row, cut, seed, gap_average"
             ));
         }
     }
@@ -73,12 +78,12 @@ pub struct SweepRow {
     pub seconds: f64,
 }
 
-/// Runs the Cartesian product of the parameters. With `shell`, each point
+/// Runs the Cartesian product of the parameters. With `grow`, each point
 /// also grows the pasta (slow). `progress` gets the number finished.
 pub fn sweep(
     base: &Project,
     params: &[SweepParam],
-    shell: bool,
+    grow: bool,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Vec<SweepRow> {
     let mut points: Vec<Vec<(String, f64)>> = vec![Vec::new()];
@@ -100,15 +105,15 @@ pub fn sweep(
         .map(|values| {
             let t0 = std::time::Instant::now();
             let mut p = base.clone();
-            p.shell.threads = 1;
+            p.solid.threads = 1;
             let mut row = SweepRow { values: values.clone(), report: None, error: None, seconds: 0.0 };
             let mut run = || -> Result<RunReport, String> {
                 for (name, v) in &values {
                     apply_param(&mut p, name, *v)?;
                 }
                 let die = solve_die(&p, MeshQuality::Fine, None, 1, &|| false)?;
-                let shell_result = if shell { Some(run_shell(&p, &die, &mut |_| {}, &|| false)?) } else { None };
-                Ok(RunReport::new(&p, &die, shell_result.as_ref()))
+                let report = RunReport::new(&p, &die, None);
+                Ok(if grow { report.with_solid(&run_solid(&p, &die, &mut |_| {}, &|| false)?) } else { report })
             };
             match run() {
                 Ok(r) => row.report = Some(r),

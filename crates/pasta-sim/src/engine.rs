@@ -2,9 +2,9 @@
 //! picks up the newest finished result on its next frame. A newer request
 //! cancels older work between Newton steps.
 
-use crate::project::{DieOutput, MeshQuality, Project, run_shell, solve_die};
+use crate::project::{DieOutput, MeshQuality, Project, run_solid, solve_die};
 use arc_swap::ArcSwapOption;
-use pasta_shell::{ShellResult, Snapshot};
+use pasta_solid::{Snapshot, SolidResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -15,15 +15,16 @@ pub struct DieJob {
     pub quality: MeshQuality,
 }
 
+/// Grow the pasta from a finished die solve.
 #[derive(Clone)]
-pub struct ShellJob {
+pub struct GrowJob {
     pub project: Project,
     pub die: Arc<DieOutput>,
 }
 
-/// Latest progress of the running shell job.
+/// Latest progress of the running grow job.
 #[derive(Clone)]
-pub struct ShellProgress {
+pub struct GrowProgress {
     pub generation: u64,
     pub snapshot: Snapshot,
 }
@@ -33,29 +34,29 @@ pub struct ShellProgress {
 pub struct Outputs {
     pub die: ArcSwapOption<(u64, DieOutput)>,
     pub die_error: ArcSwapOption<(u64, String)>,
-    pub shell_progress: ArcSwapOption<ShellProgress>,
-    pub shell: ArcSwapOption<(u64, ShellResult)>,
-    pub shell_error: ArcSwapOption<(u64, String)>,
+    pub grow_progress: ArcSwapOption<GrowProgress>,
+    pub piece: ArcSwapOption<(u64, SolidResult)>,
+    pub grow_error: ArcSwapOption<(u64, String)>,
 }
 
 pub struct Engine {
     die_gen: Arc<AtomicU64>,
-    shell_gen: Arc<AtomicU64>,
+    grow_gen: Arc<AtomicU64>,
     die_tx: Sender<(u64, DieJob)>,
-    shell_tx: Sender<(u64, ShellJob)>,
+    grow_tx: Sender<(u64, GrowJob)>,
     pub outputs: Arc<Outputs>,
     /// Called whenever a worker publishes something (e.g. to wake the UI).
     notify: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
 }
 
 impl Engine {
-    pub fn new(shell_threads: usize) -> Self {
+    pub fn new(grow_threads: usize) -> Self {
         let die_gen = Arc::new(AtomicU64::new(0));
-        let shell_gen = Arc::new(AtomicU64::new(0));
+        let grow_gen = Arc::new(AtomicU64::new(0));
         let outputs = Arc::new(Outputs::default());
         let notify: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(None));
         let (die_tx, die_rx) = channel::<(u64, DieJob)>();
-        let (shell_tx, shell_rx) = channel::<(u64, ShellJob)>();
+        let (grow_tx, grow_rx) = channel::<(u64, GrowJob)>();
         {
             let (g, out, note) = (die_gen.clone(), outputs.clone(), notify.clone());
             std::thread::Builder::new()
@@ -64,13 +65,13 @@ impl Engine {
                 .expect("spawn die worker");
         }
         {
-            let (g, out, note) = (shell_gen.clone(), outputs.clone(), notify.clone());
+            let (g, out, note) = (grow_gen.clone(), outputs.clone(), notify.clone());
             std::thread::Builder::new()
-                .name("shell".into())
-                .spawn(move || shell_worker(shell_rx, g, out, note, shell_threads))
-                .expect("spawn shell worker");
+                .name("grow".into())
+                .spawn(move || grow_worker(grow_rx, g, out, note, grow_threads))
+                .expect("spawn grow worker");
         }
-        Self { die_gen, shell_gen, die_tx, shell_tx, outputs, notify }
+        Self { die_gen, grow_gen, die_tx, grow_tx, outputs, notify }
     }
 
     pub fn set_notify(&self, f: impl Fn() + Send + 'static) {
@@ -84,19 +85,19 @@ impl Engine {
         g
     }
 
-    pub fn submit_shell(&self, job: ShellJob) -> u64 {
-        let g = self.shell_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.shell_tx.send((g, job));
+    pub fn submit_grow(&self, job: GrowJob) -> u64 {
+        let g = self.grow_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.grow_tx.send((g, job));
         g
     }
 
-    /// Cancels the running shell job, if any.
-    pub fn cancel_shell(&self) {
-        self.shell_gen.fetch_add(1, Ordering::SeqCst);
+    /// Cancels the running grow job, if any.
+    pub fn cancel_grow(&self) {
+        self.grow_gen.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub fn shell_generation(&self) -> u64 {
-        self.shell_gen.load(Ordering::SeqCst)
+    pub fn grow_generation(&self) -> u64 {
+        self.grow_gen.load(Ordering::SeqCst)
     }
 
     pub fn die_generation(&self) -> u64 {
@@ -137,8 +138,8 @@ fn die_worker(
     }
 }
 
-fn shell_worker(
-    rx: Receiver<(u64, ShellJob)>,
+fn grow_worker(
+    rx: Receiver<(u64, GrowJob)>,
     generation: Arc<AtomicU64>,
     out: Arc<Outputs>,
     note: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
@@ -152,19 +153,19 @@ fn shell_worker(
         if generation.load(Ordering::SeqCst) != g {
             continue;
         }
-        job.project.shell.threads = threads;
+        job.project.solid.threads = threads;
         let cancel = || generation.load(Ordering::SeqCst) != g;
         let mut progress = |s: &Snapshot| {
-            out.shell_progress.store(Some(Arc::new(ShellProgress { generation: g, snapshot: s.clone() })));
+            out.grow_progress.store(Some(Arc::new(GrowProgress { generation: g, snapshot: s.clone() })));
             ping(&note);
         };
-        match run_shell(&job.project, &job.die, &mut progress, &cancel) {
+        match run_solid(&job.project, &job.die, &mut progress, &cancel) {
             Ok(r) => {
-                out.shell.store(Some(Arc::new((g, r))));
-                out.shell_error.store(None);
+                out.piece.store(Some(Arc::new((g, r))));
+                out.grow_error.store(None);
             }
             Err(e) if e == "cancelled" => continue,
-            Err(e) => out.shell_error.store(Some(Arc::new((g, e)))),
+            Err(e) => out.grow_error.store(Some(Arc::new((g, e)))),
         }
         ping(&note);
     }

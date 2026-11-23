@@ -1,0 +1,16 @@
+[package]
+name = "pasta-solid"
+description = "Growing solid of quadratic tetrahedra: the pasta extruded from any die opening"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pasta-linalg.workspace = true
+glam.workspace = true
+rayon.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

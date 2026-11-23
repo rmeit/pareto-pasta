@@ -1,11 +1,11 @@
 //! `pasta`: headless runs of the Tier 1 model.
 
 use clap::{Parser, Subcommand};
-use pasta_sim::{MeshQuality, Project, RunReport, SweepParam, run_shell, solve_die, sweep, write_obj, write_stl};
+use pasta_sim::{MeshQuality, Project, RunReport, SweepParam, run_solid, solid_section, solve_die, sweep, write_obj, write_stl};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "pasta", about = "Simulate pasta extrusion: die flow and the growing sheet")]
+#[command(name = "pasta", about = "Simulate pasta extrusion: die flow and the growing piece")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,9 +33,10 @@ enum Cmd {
         #[arg(long)]
         draft: bool,
     },
-    /// Die flow plus the growing shell.
+    /// Die flow plus the growing pasta (a solid of quadratic tets).
     Run {
         project: PathBuf,
+        /// Surface of the cut piece as it hangs from the die (OBJ).
         #[arg(long)]
         obj: Option<PathBuf>,
         #[arg(long)]
@@ -45,6 +46,27 @@ enum Cmd {
         relaxed_obj: Option<PathBuf>,
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Override the cut length (mm).
+        #[arg(long)]
+        cut: Option<f64>,
+        /// Override the elements across the thinnest part of the opening.
+        #[arg(long)]
+        cells: Option<usize>,
+        /// Threads for the factorisation of large systems.
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        /// Write the growing surface every N rows as numbered OBJ files in
+        /// this directory.
+        #[arg(long)]
+        frames: Option<PathBuf>,
+        #[arg(long, default_value_t = 10)]
+        frame_every: usize,
+        /// Write the solid's cross-section (points and exit speeds) as CSV.
+        #[arg(long)]
+        section_csv: Option<PathBuf>,
+        /// Stop after building the section (no growth).
+        #[arg(long)]
+        section_only: bool,
     },
     /// Cartesian sweep over parameters, one run per core.
     Sweep {
@@ -52,9 +74,9 @@ enum Cmd {
         /// name=a,b,c or name=start:stop:count; repeat for more parameters.
         #[arg(long = "set", required = true)]
         set: Vec<String>,
-        /// Also grow the shell for each point (slow).
+        /// Also grow the pasta for each point (slow).
         #[arg(long)]
-        shell: bool,
+        grow: bool,
         #[arg(short, long, default_value = "sweep.csv")]
         out: PathBuf,
     },
@@ -136,52 +158,104 @@ fn run() -> Result<(), String> {
                 std::fs::write(&path, s).map_err(|e| e.to_string())?;
             }
         }
-        Cmd::Run { project, obj, stl, relaxed_obj, json } => {
-            let p = load(&project)?;
+        Cmd::Run { project, obj, stl, relaxed_obj, json, cut, cells, threads, frames, frame_every, section_csv, section_only } => {
+            let mut p = load(&project)?;
+            if let Some(c) = cut {
+                p.solid.cut_length = c;
+            }
+            if let Some(c) = cells {
+                p.solid.cells_across = c;
+            }
+            p.solid.threads = threads;
             let die = solve_die(&p, MeshQuality::Fine, None, 4, &|| false)?;
             print_flow(&p, &die);
+            let section = solid_section(&p, &die)?;
+            let (vmin, vmax) = section.speed.iter().fold((f64::INFINITY, 0.0f64), |(a, b), &v| (a.min(v), b.max(v)));
+            println!(
+                "  section: {} triangles, {} points, element {:.2} mm, exit speed {:.1} to {:.1} mm/s (ratio {:.2})",
+                section.tris.len(),
+                section.points.len(),
+                section.mean_edge(),
+                vmin,
+                vmax,
+                vmax / vmin
+            );
+            if let Some(path) = &section_csv {
+                let mut s = String::from("x_mm,y_mm,speed_mm_s,corner\n");
+                for (k, (q, v)) in section.points.iter().zip(&section.speed).enumerate() {
+                    s.push_str(&format!("{},{},{},{}\n", q[0], q[1], v, (k < section.n_corners) as u8));
+                }
+                std::fs::write(path, s).map_err(|e| e.to_string())?;
+            }
+            if section_only {
+                return Ok(());
+            }
+            if let Some(dir) = &frames {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
             let mut last = 0;
-            let shell = run_shell(
+            let mut frame_rows = 0;
+            let mut frame_list: Vec<(usize, pasta_sim::solid::Keyframe)> = Vec::new();
+            let r = run_solid(
                 &p,
                 &die,
                 &mut |s| {
-                    if s.stats.rows >= last + 25 {
+                    if s.stats.rows >= last + 10 {
                         last = s.stats.rows;
-                        eprintln!("  growing: {:.1} mm, {} rows, {:.1} s", s.piece_length, s.stats.rows, s.stats.seconds);
+                        eprintln!(
+                            "  growing: {:.1} mm, {} rows, {} unknowns, {:.1} s, {} Newton iterations ({} shifted)",
+                            s.piece_length, s.stats.rows, s.stats.dofs, s.stats.seconds, s.stats.newton_iterations, s.stats.shifted_solves
+                        );
+                    }
+                    if frames.is_some() && s.stats.rows >= frame_rows + frame_every {
+                        frame_rows = s.stats.rows;
+                        frame_list.push((s.stats.rows, s.keyframe.clone()));
                     }
                 },
                 &|| false,
             )?;
-            let tris = shell.outside_triangles();
-            let report = RunReport::new(&p, &die, Some(&shell));
-            println!("  shell: {} nodes, {} triangles, {:.1} s, {} Newton iterations", shell.stats.nodes, shell.stats.triangles, shell.stats.seconds, shell.stats.newton_iterations);
-            for (label, m) in [("hanging", &report.hanging), ("relaxed", &report.relaxed)] {
+            if let Some(dir) = &frames {
+                for (k, (rows, kf)) in frame_list.iter().enumerate() {
+                    let path = dir.join(format!("frame_{k:03}_rows_{rows}.obj"));
+                    write_obj(&path, &kf.positions, &r.surface[..kf.triangles]).map_err(|e| e.to_string())?;
+                }
+            }
+            let report = RunReport::new(&p, &die, None).with_solid(&r);
+            let st = &r.stats;
+            println!(
+                "  solid: {} tets, {} nodes, {} rows, {:.1} s ({:.1} s factorising), {} Newton iterations ({} shifted), {} unconverged steps",
+                st.tets, st.nodes, st.rows, st.seconds, st.time_solve, st.newton_iterations, st.shifted_solves, st.unconverged_steps
+            );
+            for (label, m) in [("hanging", &report.piece_hanging), ("relaxed", &report.piece_relaxed)] {
                 if let Some(m) = m {
-                    println!("  {label}: length {:.1} mm, curl radius {}", m.length, fmt_opt(m.curl_radius, "mm"));
-                    for (side, e) in [("left", &m.left_edge), ("right", &m.right_edge)] {
-                        if let Some(e) = e {
-                            println!("    {side} edge: wavelength {}, amplitude {:.2} mm, length ratio {:.3}", fmt_opt(e.wavelength, "mm"), e.amplitude, e.length_ratio);
-                        }
-                    }
+                    println!(
+                        "  {label}: {:.1} x {:.1} x {:.1} mm, twist {:+.2} turns (pitch {}), bend radius {}",
+                        m.length,
+                        m.width,
+                        m.depth,
+                        m.twist_turns,
+                        fmt_opt(m.pitch, "mm"),
+                        fmt_opt(m.bend_radius, "mm")
+                    );
                 }
             }
             if let Some(path) = obj {
-                write_obj(&path, &shell.hanging, &tris).map_err(|e| e.to_string())?;
+                write_obj(&path, &r.hanging, &r.piece_surface).map_err(|e| e.to_string())?;
             }
             if let Some(path) = stl {
-                write_stl(&path, &shell.hanging, &tris).map_err(|e| e.to_string())?;
+                write_stl(&path, &r.hanging, &r.piece_surface).map_err(|e| e.to_string())?;
             }
-            if let (Some(path), Some(rel)) = (relaxed_obj, &shell.relaxed) {
-                write_obj(&path, rel, &tris).map_err(|e| e.to_string())?;
+            if let (Some(path), Some(rel)) = (relaxed_obj, &r.relaxed) {
+                write_obj(&path, rel, &r.piece_surface).map_err(|e| e.to_string())?;
             }
             if let Some(path) = json {
                 std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).map_err(|e| e.to_string())?;
             }
         }
-        Cmd::Sweep { project, set, shell, out } => {
+        Cmd::Sweep { project, set, grow, out } => {
             let p = load(&project)?;
             let params: Vec<SweepParam> = set.iter().map(|s| SweepParam::parse(s)).collect::<Result<_, _>>()?;
-            let rows = sweep(&p, &params, shell, &|k, n| eprint!("\r  {k}/{n}"));
+            let rows = sweep(&p, &params, grow, &|k, n| eprint!("\r  {k}/{n}"));
             eprintln!();
             let mut s = String::new();
             for prm in &params {
@@ -189,8 +263,8 @@ fn run() -> Result<(), String> {
                 s.push(',');
             }
             s.push_str("opening,pressure_kpa,mean_speed,edge_centre_ratio,max_min_ratio,curl_radius,bend_radius,ruffle_margin,wavelength_est,amplitude_est");
-            if shell {
-                s.push_str(",sim_length,sim_curl_radius,sim_left_wavelength,sim_left_amplitude,sim_left_length_ratio");
+            if grow {
+                s.push_str(",sim_length,sim_width,sim_depth,sim_twist_turns,sim_bend_radius");
             }
             s.push_str(",seconds,error\n");
             let f = |v: Option<f64>| v.map(|x| format!("{x}")).unwrap_or_default();
@@ -213,16 +287,15 @@ fn run() -> Result<(), String> {
                                 f(r.wavelength),
                                 f(r.amplitude)
                             ));
-                            if shell {
-                                let m = rep.relaxed.as_ref().or(rep.hanging.as_ref());
-                                let le = m.and_then(|m| m.left_edge.as_ref());
+                            if grow {
+                                let m = rep.piece_relaxed.as_ref().or(rep.piece_hanging.as_ref());
                                 s.push_str(&format!(
                                     ",{},{},{},{},{}",
                                     f(m.map(|m| m.length)),
-                                    f(m.and_then(|m| m.curl_radius)),
-                                    f(le.and_then(|e| e.wavelength)),
-                                    f(le.map(|e| e.amplitude)),
-                                    f(le.map(|e| e.length_ratio))
+                                    f(m.map(|m| m.width)),
+                                    f(m.map(|m| m.depth)),
+                                    f(m.map(|m| m.twist_turns)),
+                                    f(m.and_then(|m| m.bend_radius))
                                 ));
                             }
                             s.push_str(&format!(",{},\n", row.seconds));

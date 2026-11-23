@@ -151,11 +151,11 @@ fn mesh_slot(m: &mut TriMesh2, k: usize, slot: &Slot, opts: &MeshOptions) -> Res
     if slot.centerline.len() < 2 || (slot.closed && slot.centerline.len() < 3) {
         return Err(MeshError::TooFewPoints { opening: k });
     }
-    let n_layers = opts.cells_across.max(2) + 1;
+    let n_layers = opts.cells_across.max(1) + 1;
     // Station count from the arc length and the narrowest gap.
     let probe = Centerline::new(&slot.centerline, slot.closed, 256);
     let min_gap = slot.gap.min().max(1e-6);
-    let ds = min_gap / opts.cells_across.max(2) as f64 * opts.aspect;
+    let ds = min_gap / opts.cells_across.max(1) as f64 * opts.aspect;
     let segs = ((probe.length() / ds).ceil() as usize).clamp(8, opts.max_stations);
     let c = Centerline::new(&slot.centerline, slot.closed, segs);
     let n_st = c.len();
@@ -276,13 +276,37 @@ fn mesh_polygon(m: &mut TriMesh2, k: usize, poly: &PolygonOpening, opts: &MeshOp
     // Twice area over perimeter is the half-width of a thin strip and the
     // radius of a disc: a rough feature size.
     let feature = 2.0 * (area_outer - holes_area) / perim;
-    let h = 2.0 * feature / opts.cells_across.max(2) as f64;
+    let h = 2.0 * feature / opts.cells_across.max(1) as f64;
     let err = |e: spade::InsertionError| MeshError::Triangulation { opening: k, message: format!("{e:?}") };
 
     let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> = ConstrainedDelaunayTriangulation::new();
     let densify = |ring: &[[f64; 2]]| -> Vec<Point2<f64>> {
         let n = ring.len();
         let mut out = Vec::new();
+        // An outline drawn much finer than the mesh would force tiny
+        // triangles: resample it evenly at the mesh size instead.
+        let seg: Vec<f64> = (0..n)
+            .map(|i| {
+                let (a, b) = (ring[i], ring[(i + 1) % n]);
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+            })
+            .collect();
+        let total: f64 = seg.iter().sum();
+        if total / (n as f64) < 0.5 * h {
+            let m = ((total / h).round() as usize).max(3);
+            let (mut i, mut acc) = (0, 0.0);
+            for q in 0..m {
+                let target = total * q as f64 / m as f64;
+                while acc + seg[i] < target && i + 1 < n {
+                    acc += seg[i];
+                    i += 1;
+                }
+                let t = ((target - acc) / seg[i].max(1e-300)).clamp(0.0, 1.0);
+                let (a, b) = (ring[i], ring[(i + 1) % n]);
+                out.push(Point2::new(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])));
+            }
+            return out;
+        }
         for i in 0..n {
             let a = ring[i];
             let b = ring[(i + 1) % n];
@@ -330,7 +354,8 @@ fn mesh_polygon(m: &mut TriMesh2, k: usize, poly: &PolygonOpening, opts: &MeshOp
         }
         m.tris.push(ids);
         m.tri_opening.push(k as u32);
-        m.tri_land.push(poly.land.max(1e-6));
+        let [pa, pb, pc] = ids.map(|i| m.nodes[i as usize]);
+        m.tri_land.push(poly.land_at([(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0]).max(1e-6));
         let t = m.tris.len() - 1;
         let a = m.tri_area(t);
         if a < 0.0 {
@@ -418,6 +443,7 @@ mod tests {
         let d = Die {
             name: "disc".into(),
             openings: vec![Opening::Polygon(PolygonOpening {
+                land_radial: None,
                 outer,
                 holes: vec![],
                 land: 3.0,

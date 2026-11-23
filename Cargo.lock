@@ -2402,6 +2402,7 @@ name = "pasta-linalg"
 version = "0.1.0"
 dependencies = [
  "faer",
+ "rayon",
 ]
 
 [[package]]
@@ -2422,10 +2423,21 @@ dependencies = [
  "pasta-die",
  "pasta-flow",
  "pasta-shell",
+ "pasta-solid",
  "rayon",
  "ron",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "pasta-solid"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "pasta-linalg",
+ "rayon",
+ "serde",
 ]
 
 [[package]]

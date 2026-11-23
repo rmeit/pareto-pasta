@@ -13,6 +13,7 @@ pasta-linalg = { path = "crates/pasta-linalg" }
 pasta-die = { path = "crates/pasta-die" }
 pasta-flow = { path = "crates/pasta-flow" }
 pasta-shell = { path = "crates/pasta-shell" }
+pasta-solid = { path = "crates/pasta-solid" }
 pasta-sim = { path = "crates/pasta-sim" }
 faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }
 spade = "2.15"

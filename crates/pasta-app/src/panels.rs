@@ -6,7 +6,7 @@ use crate::viewport::Material;
 use egui::{Color32, RichText};
 use egui_plot::{HLine, Legend, Line, Plot, PlotPoints};
 use pasta_sim::die::{Opening, Profile, WallFinish};
-use pasta_sim::shell::{Orientation, measure};
+use pasta_sim::solid::{Orientation, measure};
 use pasta_sim::{DriveSpec, Project};
 
 pub fn top_bar(app: &mut App, ui: &mut egui::Ui) -> Option<Command> {
@@ -21,12 +21,12 @@ pub fn top_bar(app: &mut App, ui: &mut egui::Ui) -> Option<Command> {
                 for p in pasta_sim::die::presets() {
                     if ui.button(p.name).on_hover_text(p.description).clicked() {
                         let mut proj = Project::new(p.die);
-                        // Keep the dough and sheet settings.
+                        // Keep the dough and pasta settings.
                         proj.rheology = app.project.rheology;
                         proj.drive = app.project.drive;
                         proj.swell = app.project.swell;
                         proj.ruffle_c = app.project.ruffle_c;
-                        proj.shell = app.project.shell.clone();
+                        proj.solid = app.project.solid.clone();
                         app.load_project(proj, None);
                         ui.close();
                     }
@@ -79,7 +79,7 @@ pub fn bottom_bar(app: &mut App, ui: &mut egui::Ui) -> Option<Command> {
     let mut cmd = None;
     egui::Panel::bottom("bottom").show(ui, |ui| {
         ui.horizontal(|ui| {
-            if app.shell_running() {
+            if app.grow_running() {
                 if ui.button("Stop").clicked() {
                     cmd = Some(Command::Stop);
                 }
@@ -88,7 +88,7 @@ pub fn bottom_bar(app: &mut App, ui: &mut egui::Ui) -> Option<Command> {
             }
             ui.checkbox(&mut app.auto_grow, "Grow after each edit");
             ui.separator();
-            let n = app.shell.as_ref().map(|s| s.1.keyframes.len()).unwrap_or(0);
+            let n = app.piece.as_ref().map(|s| s.1.keyframes.len()).unwrap_or(0);
             if n > 0 {
                 let play = if app.playing { "Pause" } else { "Play" };
                 if ui.button(play).on_hover_text("Play the growth (Space)").clicked() {
@@ -101,7 +101,7 @@ pub fn bottom_bar(app: &mut App, ui: &mut egui::Ui) -> Option<Command> {
                     app.shape_view = ShapeView::Timeline;
                     app.playing = false;
                 }
-                if let Some(s) = &app.shell {
+                if let Some(s) = &app.piece {
                     let t = s.1.keyframes.get(k).map(|f| f.time).unwrap_or(0.0);
                     ui.label(format!("{t:.2} s"));
                 }
@@ -133,15 +133,15 @@ fn status_text(app: &App) -> String {
             100.0 * f.error_estimate
         ));
     }
-    if let Some(e) = &app.shell_error {
+    if let Some(e) = &app.grow_error {
         parts.push(format!("Pasta: {e}"));
-    } else if app.shell_running() {
-        if let Some(p) = &app.shell_progress {
+    } else if app.grow_running() {
+        if let Some(p) = &app.grow_progress {
             parts.push(format!("Growing: {:.1} mm, {} rows, {:.1} s", p.snapshot.piece_length, p.snapshot.stats.rows, p.snapshot.stats.seconds));
         } else {
             parts.push("Growing…".into());
         }
-    } else if let Some(s) = &app.shell {
+    } else if let Some(s) = &app.piece {
         let st = &s.1.stats;
         parts.push(format!("Pasta: {} nodes, {} Newton iterations, {:.1} s", st.nodes, st.newton_iterations, st.seconds));
     }
@@ -176,7 +176,7 @@ pub fn die_panel(app: &mut App, ui: &mut egui::Ui) {
     ui.label(RichText::new("Speed along the slot centre-line").strong());
     let Some(d) = &app.die else { return };
     let Some(prof) = d.1.profile(app.project.opening) else {
-        ui.label("This opening is not a slot: it gets a flow solve only.");
+        ui.label("This opening is not a slot, so it has no centre-line profile. It still grows in 3D.");
         return;
     };
     let n = prof.v.len();
@@ -314,10 +314,11 @@ pub fn params_panel(app: &mut App, ui: &mut egui::Ui) {
             (_, false) => pr.drive = DriveSpec::Pressure { kpa: 5000.0 },
         }
     });
-    section(ui, "Sheet", true, |ui| {
-        slider(ui, &mut pr.swell, 0.8..=2.0, "Die swell", " x", "Thickness multiplier at the exit; speed is divided by it");
-        let s = &mut pr.shell;
+    section(ui, "Pasta", true, |ui| {
+        slider(ui, &mut pr.swell, 0.8..=2.0, "Die swell", " x", "The section grows by this factor at the exit; speed falls by its square");
+        let s = &mut pr.solid;
         log_slider(ui, &mut s.young_kpa, 1.0..=2000.0, "Stiffness E", " kPa", "Elastic modulus of fresh dough");
+        slider(ui, &mut s.poisson, 0.0..=0.49, "Poisson's ratio", "", "Near 0.5 the dough is almost incompressible");
         slider(ui, &mut s.density, 0.8..=2.0, "Density", " g/cm³", "");
         egui::ComboBox::from_label("Extrusion").selected_text(match s.orientation {
             Orientation::Down => "Downward",
@@ -329,20 +330,18 @@ pub fn params_panel(app: &mut App, ui: &mut egui::Ui) {
         if s.orientation == Orientation::Horizontal {
             slider(ui, &mut s.support_drop, 0.0..=50.0, "Drop to surface", " mm", "From the bottom of the opening down to the support");
         }
-        slider(ui, &mut s.cut_length, 10.0..=200.0, "Cut length", " mm", "The piece is cut at this length");
-        let mut creep = s.creep_time.is_some();
-        if ui.checkbox(&mut creep, "Dough creeps").on_hover_text("Rest shape drifts toward the current shape").changed() {
-            s.creep_time = if creep { Some(5.0) } else { None };
-        }
-        if let Some(t) = &mut s.creep_time {
-            log_slider(ui, t, 0.1..=100.0, "Creep time", " s", "");
-        }
+        slider(ui, &mut s.cut_length, 5.0..=200.0, "Cut length", " mm", "The piece is cut at this length");
         ui.checkbox(&mut s.relax_after_cut, "Also relax the cut piece");
+        ui.checkbox(&mut s.gap_average, "Average speed across the gap").on_hover_text(
+            "Slots only. Past the exit the slow dough at the walls is pulled along by the core, so each point \
+             takes the gap-mean speed (keeping its tilt from wall to wall). Needed when the dough sticks to the walls.",
+        );
         egui::CollapsingHeader::new("Resolution").default_open(false).show(ui, |ui| {
-            let mut st = s.stations as f64;
-            slider(ui, &mut st, 12.0..=128.0, "Stations", "", "Nodes across the slot; cost grows about as the cube");
-            s.stations = st.round() as usize;
-            slider(ui, &mut s.refine, 1.0..=8.0, "Edge refinement", " x", "Pack stations where the speed changes fastest");
+            let mut c = s.cells_across as f64;
+            slider(ui, &mut c, 1.0..=4.0, "Elements across", "", "Quadratic elements across the thinnest part of the opening; one is enough to bend correctly");
+            s.cells_across = c.round() as usize;
+            slider(ui, &mut s.station_aspect, 0.3..=3.0, "Element length", " × gap", "Element size along a slot, relative to its narrowest gap");
+            slider(ui, &mut s.row_aspect, 0.3..=3.0, "Row spacing", " × element", "Spacing of rows along the pasta, relative to the section's element size");
             let mut sub = s.substeps as f64;
             slider(ui, &mut sub, 1.0..=8.0, "Steps per row", "", "");
             s.substeps = sub.round() as usize;
@@ -434,25 +433,20 @@ fn readouts(app: &mut App, ui: &mut egui::Ui) {
         && *pl > 0.01 {
             card(ui, "Plug flow", format!("{:.0}%", 100.0 * pl), 0, "Area moving as an unsheared block (yield stress)");
         }
-    if let Some(s) = &app.shell {
+    if let Some(s) = &app.piece {
         let r = &s.1;
         let pos = if app.shape_view == ShapeView::Relaxed { r.relaxed.as_ref().unwrap_or(&r.hanging) } else { &r.hanging };
         let m = measure(r, pos);
         ui.add_space(4.0);
         ui.label(RichText::new("Simulated pasta").strong());
-        card(ui, "Length", format!("{:.1} mm", m.length), 0, "Along the centre-line");
-        if let Some(c) = m.curl_radius {
-            card(ui, "Curl radius", format!("{c:.0} mm"), 0, "Mean curvature of the centre-line");
+        card(ui, "Size", format!("{:.1} × {:.1} × {:.1} mm", m.length, m.width, m.depth), 0, "Extents along the piece's principal axes");
+        if m.twist_turns.abs() >= 0.05 {
+            card(ui, "Twist", format!("{:+.2} turns", m.twist_turns), 0, &format!("Pitch {} (positive is counter-clockwise looking along the extrusion)", m.pitch.map(|p| format!("{p:.1} mm")).unwrap_or_else(|| "-".into())));
         }
-        for (side, e) in [("Left edge", &m.left_edge), ("Right edge", &m.right_edge)] {
-            if let Some(e) = e {
-                let v = match e.wavelength {
-                    Some(l) => format!("λ {l:.1} mm, A {:.2} mm", e.amplitude),
-                    None => "flat".into(),
-                };
-                card(ui, side, v, 0, &format!("Edge length is {:.2}× the centre-line", e.length_ratio));
-            }
+        if let Some(b) = m.bend_radius {
+            card(ui, "Bend radius", format!("{b:.0} mm"), 0, "Circle through the start, middle and end of the centre-line");
         }
+        card(ui, "Model", format!("{} quadratic tets", r.stats.tets), 0, &format!("{} nodes, {:.0} s", r.stats.nodes, r.stats.seconds));
     }
     if let Some(info) = &app.pick_info {
         ui.add_space(4.0);
@@ -476,7 +470,7 @@ pub fn view_overlay(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
-    if app.shell.is_none() && app.shell_progress.is_none() {
+    if app.piece.is_none() && app.grow_progress.is_none() {
         let msg = if app.die.is_none() { "Solving the die…" } else { "Press Grow (G) to extrude the pasta" };
         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(16.0), ui.visuals().weak_text_color());
     }

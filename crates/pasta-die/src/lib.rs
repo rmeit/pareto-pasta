@@ -11,7 +11,7 @@ mod presets;
 pub use export::{to_dxf, to_svg};
 pub use geometry::{Centerline, Profile};
 pub use mesh::{BoundaryEdge, MeshError, MeshOptions, OpeningMesh, SlotGrid, TriMesh2, mesh_die};
-pub use presets::{Preset, preset, presets};
+pub use presets::{Preset, preset, presets, y_outline};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,8 +78,45 @@ pub struct Slot {
 pub struct PolygonOpening {
     pub outer: Vec<[f64; 2]>,
     pub holes: Vec<Vec<[f64; 2]>>,
+    /// Land depth (mm) where `land_radial` is empty.
     pub land: f64,
     pub wall: WallFinish,
+    /// Optional land depth (mm) against distance (mm) from the centroid of
+    /// the outer outline, e.g. a long land at the core of a Y and short
+    /// lands (counterbored from the back of the die) at the arm tips.
+    #[serde(default)]
+    pub land_radial: Option<Profile>,
+}
+
+impl PolygonOpening {
+    /// Centroid of the outer outline (area-weighted).
+    pub fn centroid(&self) -> [f64; 2] {
+        let p = &self.outer;
+        let n = p.len();
+        let (mut a, mut cx, mut cy) = (0.0, 0.0, 0.0);
+        for i in 0..n {
+            let (x0, y0, x1, y1) = (p[i][0], p[i][1], p[(i + 1) % n][0], p[(i + 1) % n][1]);
+            let c = x0 * y1 - x1 * y0;
+            a += c;
+            cx += (x0 + x1) * c;
+            cy += (y0 + y1) * c;
+        }
+        if a.abs() < 1e-300 {
+            return [0.0, 0.0];
+        }
+        [cx / (3.0 * a), cy / (3.0 * a)]
+    }
+
+    /// Land depth at a point of the opening.
+    pub fn land_at(&self, q: [f64; 2]) -> f64 {
+        match &self.land_radial {
+            Some(prof) => {
+                let c = self.centroid();
+                prof.eval(((q[0] - c[0]).powi(2) + (q[1] - c[1]).powi(2)).sqrt())
+            }
+            None => self.land,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -2,8 +2,8 @@
 
 use crate::die_canvas::DieCanvas;
 use crate::viewport::{ColorMap, Overlay, SceneMesh, ViewPreset, ViewSettings, Viewport, save_png};
-use pasta_sim::shell::{Orientation, ShellResult, measure};
-use pasta_sim::{DieJob, DieOutput, Engine, MeshQuality, Project, RunReport, ShellJob, ShellProgress, write_obj, write_stl};
+use pasta_sim::solid::{Orientation, SolidResult};
+use pasta_sim::{DieJob, DieOutput, Engine, MeshQuality, Project, RunReport, GrowJob, GrowProgress, write_obj, write_stl};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,18 +13,16 @@ pub enum ColorMode {
     Plain,
     ExitSpeed,
     Age,
-    Thickness,
 }
 
 impl ColorMode {
-    pub const ALL: [ColorMode; 4] = [ColorMode::Plain, ColorMode::ExitSpeed, ColorMode::Age, ColorMode::Thickness];
+    pub const ALL: [ColorMode; 3] = [ColorMode::Plain, ColorMode::ExitSpeed, ColorMode::Age];
 
     pub fn label(self) -> &'static str {
         match self {
             ColorMode::Plain => "Dough",
             ColorMode::ExitSpeed => "Exit speed",
             ColorMode::Age => "Time since exit",
-            ColorMode::Thickness => "Thickness",
         }
     }
 }
@@ -146,10 +144,10 @@ pub struct App {
     pub die: Option<Arc<(u64, DieOutput)>>,
     pub die_error: Option<String>,
     fine_gen: u64,
-    pub shell_gen: u64,
-    pub shell_progress: Option<Arc<ShellProgress>>,
-    pub shell: Option<Arc<(u64, ShellResult)>>,
-    pub shell_error: Option<String>,
+    pub grow_gen: u64,
+    pub grow_progress: Option<Arc<GrowProgress>>,
+    pub piece: Option<Arc<(u64, SolidResult)>>,
+    pub grow_error: Option<String>,
     pub auto_grow: bool,
     pub viewport: Option<Viewport>,
     pub view: ViewSettings,
@@ -200,10 +198,10 @@ impl App {
             die: None,
             die_error: None,
             fine_gen: 0,
-            shell_gen: 0,
-            shell_progress: None,
-            shell: None,
-            shell_error: None,
+            grow_gen: 0,
+            grow_progress: None,
+            piece: None,
+            grow_error: None,
             auto_grow: true,
             viewport,
             view: ViewSettings::default(),
@@ -234,7 +232,7 @@ impl App {
             self.fine_gen = g;
         } else {
             // A draft solve means the die is changing: stop growing.
-            self.engine.cancel_shell();
+            self.engine.cancel_grow();
         }
         self.submitted = Some((self.project.clone(), quality));
     }
@@ -245,20 +243,20 @@ impl App {
             return;
         }
         let die = Arc::new(d.1.clone());
-        self.shell_gen = self.engine.submit_shell(ShellJob { project: self.project.clone(), die });
-        self.shell_error = None;
+        self.grow_gen = self.engine.submit_grow(GrowJob { project: self.project.clone(), die });
+        self.grow_error = None;
         self.timeline = None;
         self.shape_view = ShapeView::Timeline;
         self.fit_pending = true;
     }
 
     pub fn stop(&mut self) {
-        self.engine.cancel_shell();
-        self.shell_gen = 0;
+        self.engine.cancel_grow();
+        self.grow_gen = 0;
     }
 
-    pub fn shell_running(&self) -> bool {
-        self.shell_gen != 0 && self.shell.as_ref().map(|s| s.0 != self.shell_gen).unwrap_or(true) && self.shell_error.is_none()
+    pub fn grow_running(&self) -> bool {
+        self.grow_gen != 0 && self.piece.as_ref().map(|s| s.0 != self.grow_gen).unwrap_or(true) && self.grow_error.is_none()
     }
 
     pub fn undo(&mut self) {
@@ -290,8 +288,8 @@ impl App {
         self.path = path;
         self.canvas = DieCanvas::default();
         self.stop();
-        self.shell = None;
-        self.shell_progress = None;
+        self.piece = None;
+        self.grow_progress = None;
         self.submit_die(MeshQuality::Fine);
         self.fit_pending = true;
     }
@@ -312,19 +310,19 @@ impl App {
             && e.0 >= self.die.as_ref().map(|d| d.0).unwrap_or(0) {
                 self.die_error = Some(e.1.clone());
             }
-        if let Some(p) = out.shell_progress.load_full()
-            && p.generation == self.shell_gen {
-                self.shell_progress = Some(p);
+        if let Some(p) = out.grow_progress.load_full()
+            && p.generation == self.grow_gen {
+                self.grow_progress = Some(p);
             }
-        if let Some(s) = out.shell.load_full()
-            && s.0 == self.shell_gen && self.shell.as_ref().map(|x| x.0) != Some(s.0) {
-                self.shell = Some(s);
+        if let Some(s) = out.piece.load_full()
+            && s.0 == self.grow_gen && self.piece.as_ref().map(|x| x.0) != Some(s.0) {
+                self.piece = Some(s);
                 self.shape_view = ShapeView::Hanging;
                 self.fit_pending = true;
             }
-        if let Some(e) = out.shell_error.load_full()
-            && e.0 == self.shell_gen {
-                self.shell_error = Some(e.1.clone());
+        if let Some(e) = out.grow_error.load_full()
+            && e.0 == self.grow_gen {
+                self.grow_error = Some(e.1.clone());
             }
     }
 
@@ -379,15 +377,15 @@ impl App {
                     }
                 }
                 Command::ExportObj | Command::ExportStl => {
-                    let shell = self.shell.as_ref().ok_or("Grow the pasta first")?;
-                    let r = &shell.1;
+                    let piece = self.piece.as_ref().ok_or("Grow the pasta first")?;
+                    let r = &piece.1;
                     let pos = match self.shape_view {
                         ShapeView::Relaxed => r.relaxed.as_ref().unwrap_or(&r.hanging),
                         _ => &r.hanging,
                     };
                     let ext = if cmd == Command::ExportObj { "obj" } else { "stl" };
                     if let Some(p) = rfd::FileDialog::new().add_filter(ext, &[ext]).set_file_name(format!("{}.{ext}", self.project.die.name)).save_file() {
-                        let tris = r.outside_triangles();
+                        let tris = r.piece_surface.clone();
                         if cmd == Command::ExportObj { write_obj(&p, pos, &tris) } else { write_stl(&p, pos, &tris) }.map_err(|e| e.to_string())?;
                         self.status = format!("Wrote {}", p.display());
                     }
@@ -402,7 +400,10 @@ impl App {
                 }
                 Command::ExportReport => {
                     let die = self.die.as_ref().ok_or("No die result yet")?;
-                    let report = RunReport::new(&self.project, &die.1, self.shell.as_ref().map(|s| &s.1));
+                    let mut report = RunReport::new(&self.project, &die.1, None);
+                    if let Some(p) = &self.piece {
+                        report = report.with_solid(&p.1);
+                    }
                     if let Some(p) = rfd::FileDialog::new().add_filter("json", &["json"]).set_file_name("report.json").save_file() {
                         std::fs::write(&p, serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                         self.status = format!("Wrote {}", p.display());
@@ -493,7 +494,7 @@ impl App {
 
     /// The pasta mesh currently selected for display.
     fn current_mesh(&self) -> Option<SceneMesh> {
-        let r = &self.shell.as_ref()?.1;
+        let r = &self.piece.as_ref()?.1;
         let pos = match self.shape_view {
             ShapeView::Hanging => r.hanging.clone(),
             ShapeView::Relaxed => r.relaxed.clone().unwrap_or_else(|| r.hanging.clone()),
@@ -508,38 +509,33 @@ impl App {
     /// Builds the 3D mesh from the newest progress or result.
     fn update_viewport_mesh(&mut self) {
         // Source: the finished result, else the latest progress keyframe.
-        let (key, positions, tri_count, stations): (u64, Arc<Vec<[f32; 3]>>, usize, usize);
-        let triangles: Option<&Vec<[u32; 3]>>;
-        let progress_tris;
-        let result = self.shell.as_ref().filter(|s| s.0 == self.shell_gen || !self.shell_running());
-        let kf_index;
+        let key: u64;
+        let positions: Arc<Vec<[f32; 3]>>;
+        let triangles: &[[u32; 3]];
+        let (speed, exit): (&[f32], &[f32]);
+        let kf_index: usize;
+        let progress;
+        let result = self.piece.as_ref().filter(|s| s.0 == self.grow_gen || !self.grow_running());
         if let Some(s) = result {
             let r = &s.1;
             key = s.0;
-            stations = r.stations;
             kf_index = self.timeline.unwrap_or(r.keyframes.len().saturating_sub(1)).min(r.keyframes.len().saturating_sub(1));
-            let (pos, count) = match self.shape_view {
-                ShapeView::Hanging => (Arc::new(r.hanging.clone()), r.triangles.len()),
-                ShapeView::Relaxed => (Arc::new(r.relaxed.clone().unwrap_or_else(|| r.hanging.clone())), r.triangles.len()),
+            (positions, triangles) = match self.shape_view {
+                ShapeView::Hanging => (Arc::new(r.hanging.clone()), &r.piece_surface[..]),
+                ShapeView::Relaxed => (Arc::new(r.relaxed.clone().unwrap_or_else(|| r.hanging.clone())), &r.piece_surface[..]),
                 ShapeView::Timeline => {
                     let kf = &r.keyframes[kf_index];
-                    (kf.positions.clone(), kf.triangles)
+                    (kf.positions.clone(), &r.surface[..kf.triangles.min(r.surface.len())])
                 }
             };
-            positions = pos;
-            tri_count = count;
-            triangles = Some(&r.triangles);
-        } else if let Some(p) = &self.shell_progress {
-            key = p.generation;
-            kf_index = p.snapshot.stats.rows;
-            positions = p.snapshot.keyframe.positions.clone();
-            tri_count = p.snapshot.keyframe.triangles;
-            stations = self.project.shell.stations.max(4);
-            // Rebuild the structured triangulation for the progress frame.
-            let rows = positions.len() / stations;
-            let closed = self.die.as_ref().and_then(|d| d.1.profile(self.project.opening)).map(|p| p.closed).unwrap_or(false);
-            progress_tris = strip_triangles(rows, stations, closed);
-            triangles = Some(&progress_tris);
+            (speed, exit) = (&r.speed_at_node, &r.exit_time);
+        } else if let Some(p) = &self.grow_progress {
+            progress = p.clone();
+            key = progress.generation;
+            kf_index = progress.snapshot.stats.rows;
+            positions = progress.snapshot.keyframe.positions.clone();
+            triangles = &progress.snapshot.surface[..];
+            (speed, exit) = (&progress.snapshot.speed_at_node[..], &progress.snapshot.exit_time[..]);
         } else {
             return;
         }
@@ -548,26 +544,21 @@ impl App {
             return;
         }
         self.shown = Some(token);
-        let Some(all) = triangles else { return };
         // Only what has left the die (z <= 0) is pasta.
         let outside = |i: u32| positions.get(i as usize).map(|p| p[2] <= 1e-4).unwrap_or(false);
-        let mut indices = Vec::with_capacity(tri_count * 3);
-        for t in all.iter().take(tri_count) {
+        let mut indices = Vec::with_capacity(triangles.len() * 3);
+        for t in triangles {
             if t.iter().all(|&i| outside(i)) {
                 indices.extend_from_slice(t);
             }
         }
+        let n = positions.len();
         let scalars = match self.color_mode {
             ColorMode::Plain => None,
-            ColorMode::ExitSpeed | ColorMode::Thickness => self.die.as_ref().and_then(|d| d.1.profile(self.project.opening)).map(|p| {
-                // Map each node's station back onto the profile by index
-                // fraction (the shell resamples the stations).
-                let src = if self.color_mode == ColorMode::ExitSpeed { &p.v } else { &p.thickness };
-                station_values(src, stations, positions.len())
-            }),
+            ColorMode::ExitSpeed => Some((0..n).map(|i| speed.get(i).copied().unwrap_or(0.0)).collect()),
             ColorMode::Age => {
-                let rows = positions.len() / stations.max(1);
-                Some((0..positions.len()).map(|i| (rows - i / stations.max(1)) as f32).collect())
+                let newest = exit.iter().take(n).cloned().fold(0.0f32, f32::max);
+                Some((0..n).map(|i| newest - exit.get(i).copied().unwrap_or(newest)).collect())
             }
         };
         let mesh = SceneMesh { positions: positions.as_ref().clone(), indices, scalars };
@@ -576,11 +567,11 @@ impl App {
             // Refit when the finished piece arrives, and during growth each
             // time the piece doubles, so it stays in frame without fighting
             // someone orbiting the camera.
-            let rows = mesh.positions.len() / stations.max(1);
-            let finished = self.shell.as_ref().is_some_and(|s| s.0 == self.shell_gen);
-            if self.fit_pending && !mesh.indices.is_empty() && (finished || rows >= 2 * self.fit_rows.max(4)) {
+            let size = mesh.positions.len();
+            let finished = self.piece.as_ref().is_some_and(|s| s.0 == self.grow_gen);
+            if self.fit_pending && !mesh.indices.is_empty() && (finished || size >= 2 * self.fit_rows.max(64)) {
                 vp.set_view(ViewPreset::Iso);
-                self.fit_rows = rows;
+                self.fit_rows = size;
                 if finished {
                     self.fit_pending = false;
                     self.fit_rows = 0;
@@ -590,7 +581,7 @@ impl App {
     }
 
     fn update_overlay(&mut self) {
-        let key = (format!("{:?}{}", self.project.die, self.ghost.is_some()), self.project.shell.orientation);
+        let key = (format!("{:?}{}", self.project.die, self.ghost.is_some()), self.project.solid.orientation);
         if self.overlay_for.as_ref() == Some(&key) {
             return;
         }
@@ -606,37 +597,6 @@ impl App {
             vp.set_overlay(&overlay);
         }
     }
-}
-
-/// The shell's structured triangulation for `rows` rows (same order as the
-/// simulator creates them).
-fn strip_triangles(rows: usize, n_s: usize, closed: bool) -> Vec<[u32; 3]> {
-    let segs = if closed { n_s } else { n_s.saturating_sub(1) };
-    let mut out = Vec::new();
-    for r in 0..rows.saturating_sub(1) {
-        for i in 0..segs {
-            let i1 = (i + 1) % n_s;
-            let a = (r * n_s + i) as u32;
-            let b = (r * n_s + i1) as u32;
-            let c = ((r + 1) * n_s + i1) as u32;
-            let d = ((r + 1) * n_s + i) as u32;
-            out.push([a, b, c]);
-            out.push([a, c, d]);
-        }
-    }
-    out
-}
-
-/// Per-node values from a per-station profile, by station fraction.
-fn station_values(src: &[f64], stations: usize, nodes: usize) -> Vec<f32> {
-    let m = src.len().max(1);
-    (0..nodes)
-        .map(|i| {
-            let s = i % stations;
-            let f = s as f64 / (stations - 1).max(1) as f64;
-            src[((f * (m - 1) as f64).round() as usize).min(m - 1)] as f32
-        })
-        .collect()
 }
 
 fn style(ctx: &egui::Context) {
@@ -667,7 +627,7 @@ impl eframe::App for App {
         }
         let before = self.project.clone();
         self.view.dark = ctx.theme() == egui::Theme::Dark;
-        self.view.up = match self.project.shell.orientation {
+        self.view.up = match self.project.solid.orientation {
             Orientation::Down => [0.0, 0.0, 1.0],
             Orientation::Horizontal => [0.0, 1.0, 0.0],
         };
@@ -711,7 +671,7 @@ impl eframe::App for App {
         self.auto_screenshot(&ctx);
         if self.playing {
             let now = ctx.input(|i| i.time);
-            let n = self.shell.as_ref().map(|s| s.1.keyframes.len()).unwrap_or(0);
+            let n = self.piece.as_ref().map(|s| s.1.keyframes.len()).unwrap_or(0);
             if n > 0 && now - self.last_play > 1.0 / 30.0 {
                 self.last_play = now;
                 self.shape_view = ShapeView::Timeline;
@@ -727,7 +687,7 @@ impl App {
     fn auto_screenshot(&mut self, ctx: &egui::Context) {
         let Some((path, frames, done)) = &mut self.screenshot else { return };
         ctx.request_repaint();
-        let ready = self.shell.is_some() || self.shell_error.is_some() || ctx.input(|i| i.time) > 600.0;
+        let ready = self.piece.is_some() || self.grow_error.is_some() || ctx.input(|i| i.time) > 600.0;
         if !ready {
             return;
         }
@@ -750,24 +710,15 @@ impl App {
 }
 
 fn pick_text(app: &App, vertex: usize, pos: [f32; 3]) -> String {
-    let Some(s) = &app.shell else { return String::new() };
+    let Some(s) = &app.piece else { return String::new() };
     let r = &s.1;
-    let n_s = r.stations.max(1);
-    let row = vertex / n_s;
-    let station = vertex % n_s;
     let speed = r.speed_at_node.get(vertex).copied().unwrap_or(0.0);
-    let h = r.thickness_at_node.get(vertex).copied().unwrap_or(0.0);
-    let rows = r.hanging.len() / n_s;
-    let m = measure(r, &r.hanging);
-    let _ = m;
+    let exit = r.exit_time.get(vertex).copied().unwrap_or(0.0);
+    let newest = r.exit_time.iter().cloned().fold(0.0f32, f32::max);
     format!(
-        "Station {} of {}, row {} of {}\nExit speed {:.2} mm/s, thickness {:.2} mm\nPosition ({:.1}, {:.1}, {:.1}) mm",
-        station + 1,
-        n_s,
-        rows - row,
-        rows,
+        "Exit speed {:.2} mm/s, left the die {:.2} s before the cut\nPosition ({:.1}, {:.1}, {:.1}) mm",
         speed,
-        h,
+        newest - exit,
         pos[0],
         pos[1],
         pos[2]
