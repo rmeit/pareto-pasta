@@ -12,7 +12,7 @@
 use crate::element::{self, EDGES, FACES, Material, Rest, mid_node};
 use crate::section::Section;
 use glam::DVec3;
-use pasta_linalg::{Par, Rng, SolveError, SpdPattern, par};
+use pasta_linalg::{Rng, SolveError, SpdPattern, par};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -65,7 +65,8 @@ pub struct SolidParams {
     pub damping: f64,
     /// After cutting, relax the piece with gravity off.
     pub relax_after_cut: bool,
-    /// Threads for the factorisation of large systems.
+    /// Threads for the factorisation (independent branches of the
+    /// elimination tree run at the same time; 8 is about the useful limit).
     pub threads: usize,
     /// Clamp each material tangent to be positive semi-definite. Off by
     /// default: the exact Hessian (shifted by the solver when indefinite)
@@ -152,12 +153,6 @@ pub struct SolidStats {
     /// Numeric factorisations, including failed attempts.
     #[serde(default)]
     pub factorisations: usize,
-    /// Conjugate-gradient iterations of the preconditioned solves.
-    #[serde(default)]
-    pub cg_iterations: usize,
-    /// Seconds in numeric factorisations (part of `time_solve`).
-    #[serde(default)]
-    pub time_factor: f64,
 }
 
 /// Positions at one moment, for the timeline.
@@ -220,14 +215,10 @@ enum NodeState {
 
 const NO_OFF: u32 = u32::MAX;
 
-/// Rows of headroom in the sparse pattern.
-const ROW_CHUNK: usize = 16;
 
 /// Pseudo-steps allowed for settling the hanging piece and for relaxing it.
 const SETTLE_STEPS: usize = 20;
 
-/// Systems larger than this use several threads for the factorisation.
-const PAR_DOFS: usize = 60_000;
 
 struct Tet {
     v: [u32; 10],
@@ -302,12 +293,6 @@ pub struct SolidSim {
     project: bool,
     /// Diagonal shift the last Newton system needed (0 if none).
     last_shift: f64,
-    /// Preconditioned CG (EXPERIMENT): iteration cap (0 = direct solves),
-    /// iterations above which the preconditioner is refreshed, tolerance.
-    pcg_max: usize,
-    pcg_refresh: usize,
-    pcg_eta: f64,
-    refactor_next: bool,
     /// Release offsets per level: sideways shift (mm) and turn (rad).
     level_kick: Vec<[f64; 3]>,
     section_centre: [f64; 2],
@@ -377,10 +362,6 @@ impl SolidSim {
             gravity_on: true,
             project: params.projected_newton,
             last_shift: 0.0,
-            pcg_max: std::env::var("PASTA_PCG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), // EXPERIMENT
-            pcg_refresh: std::env::var("PASTA_PCG_REFRESH").ok().and_then(|v| v.parse().ok()).unwrap_or(10), // EXPERIMENT
-            pcg_eta: std::env::var("PASTA_PCG_ETA").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-3), // EXPERIMENT
-            refactor_next: false,
             level_kick: Vec::new(),
             section_centre: {
                 let n = section.n_corners as f64;
@@ -559,7 +540,9 @@ impl SolidSim {
         let need = self.rows;
         let rebuild = self.pattern.as_ref().is_none_or(|p| p.rows_capacity < need);
         if rebuild {
-            let cap = need + std::env::var("PASTA_ROW_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(ROW_CHUNK); // EXPERIMENT
+            // No headroom: spare rows would be factorised (as zeros) in every
+            // solve, which costs more than rebuilding the pattern each row.
+            let cap = need;
             let n_nodes = (2 * cap - 1) * self.np;
             let mut pairs: Vec<u64> = (0..n_nodes as u64).map(|i| i << 32 | i).collect();
             for r in 0..cap - 1 {
@@ -597,15 +580,6 @@ impl SolidSim {
                 }
             }
             let spd = SpdPattern::new(3 * n_nodes, &entries)?;
-            if std::env::var("PASTA_TREE_PROFILE").is_ok() {
-                // EXPERIMENT
-                if let Some((ns, total, crit, roots)) = spd.tree_profile() {
-                    eprintln!(
-                        "TREE n {} supernodes {ns} roots {roots} total {:.2} GFLOP critical path {:.2} GFLOP bound {:.1}x",
-                        3 * n_nodes, total * 1e-9, crit * 1e-9, total / crit
-                    );
-                }
-            }
             self.stats.pattern_builds += 1;
             // Within a row, pairs are sorted by column, so the diagonal is last.
             let diag = (0..n_nodes).map(|i| offset[row_start[i + 1] - 1]).collect();
@@ -882,14 +856,9 @@ impl SolidSim {
                 converged = true;
                 break;
             }
-            let threads = if ndof > PAR_DOFS { self.p.threads } else { 1 };
             let ts = std::time::Instant::now();
             let f0 = self.pattern.as_ref().unwrap().spd.factorisations();
-            let d = if self.pcg_max > 0 {
-                self.pcg_direction(&grad, &vals, threads)?
-            } else {
-                self.direct_direction(&mut grad, &mut vals, threads)?
-            };
+            let d = self.direction(&mut grad, &mut vals, self.p.threads)?;
             self.stats.factorisations += self.pattern.as_ref().unwrap().spd.factorisations() - f0;
             self.stats.time_solve += ts.elapsed().as_secs_f64();
             self.stats.newton_iterations += 1;
@@ -932,7 +901,7 @@ impl SolidSim {
     /// the material tangents projected to be positive semi-definite instead:
     /// a sure descent direction for one more factorisation, where searching
     /// for a diagonal shift can cost ten.
-    fn direct_direction(&mut self, grad: &mut [f64], vals: &mut [f64], threads: usize) -> Result<Vec<f64>, SolidError> {
+    fn direction(&mut self, grad: &mut [f64], vals: &mut [f64], threads: usize) -> Result<Vec<f64>, SolidError> {
         let mut d: Vec<f64> = grad.iter().map(|g| -g).collect();
         let spd = &self.pattern.as_ref().unwrap().spd;
         if !spd.try_solve(vals, &mut d, par(threads))? {
@@ -946,121 +915,6 @@ impl SolidSim {
             self.last_shift = spd.solve_from(vals, &mut d, par(threads), first)?;
         }
         Ok(d)
-    }
-
-    /// Newton direction by conjugate gradients on the exact Hessian,
-    /// preconditioned with a kept factorisation that is only refreshed when
-    /// the iteration slows down.
-    fn pcg_direction(&mut self, grad: &[f64], vals: &[f64], threads: usize) -> Result<Vec<f64>, SolidError> {
-        let mut fresh = false;
-        loop {
-            if self.refactor_next || !self.pattern.as_ref().unwrap().spd.has_factor() {
-                self.refactor(vals, threads)?;
-                self.refactor_next = false;
-                fresh = true;
-            }
-            let (d, its, ok) = self.pcg(grad, vals, par(threads));
-            self.stats.cg_iterations += its;
-            if its > self.pcg_refresh {
-                self.refactor_next = true;
-            }
-            if ok || fresh {
-                return Ok(d);
-            }
-            self.refactor_next = true;
-        }
-    }
-
-    /// Factorises the exact Hessian, or the projected one with a shift if
-    /// that is indefinite, and keeps the factor as the preconditioner.
-    fn refactor(&mut self, vals: &[f64], threads: usize) -> Result<(), SolidError> {
-        let tf = std::time::Instant::now();
-        let ok = self.pattern.as_ref().unwrap().spd.factorize(vals, par(threads))?;
-        self.stats.time_factor += tf.elapsed().as_secs_f64();
-        if ok {
-            return Ok(());
-        }
-        self.stats.shifted_solves += 1;
-        let ta = std::time::Instant::now();
-        let mut g = vec![0.0; 3 * self.pattern.as_ref().unwrap().n_nodes];
-        let mut v = vec![0.0; vals.len()];
-        self.assemble(&mut g, &mut v, true);
-        self.stats.time_assemble += ta.elapsed().as_secs_f64();
-        let first = 0.25 * self.last_shift;
-        let tf = std::time::Instant::now();
-        self.last_shift = self.pattern.as_ref().unwrap().spd.factorize_from(&v, par(threads), first)?;
-        self.stats.time_factor += tf.elapsed().as_secs_f64();
-        Ok(())
-    }
-
-    /// Preconditioned CG for H d = -g, stopped at relative residual
-    /// `pcg_eta`, at `pcg_max` iterations (returns false), or at a direction
-    /// of negative curvature (returns what it has, or the preconditioned
-    /// steepest descent on the first iteration).
-    fn pcg(&self, grad: &[f64], vals: &[f64], pc: Par) -> (Vec<f64>, usize, bool) {
-        let spd = &self.pattern.as_ref().unwrap().spd;
-        let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-        let n = grad.len();
-        let tol = self.pcg_eta * dot(grad, grad).sqrt();
-        let mut d = vec![0.0; n];
-        let mut r: Vec<f64> = grad.iter().map(|g| -g).collect();
-        let mut z = r.clone();
-        spd.apply_inverse(&mut z, pc);
-        let mut p = z.clone();
-        let mut rz = dot(&r, &z);
-        let mut hp = vec![0.0; n];
-        for k in 0..self.pcg_max {
-            self.hess_mul(vals, &p, &mut hp);
-            let curv = dot(&p, &hp);
-            if !(curv > 0.0) {
-                return if k == 0 { (p, 1, true) } else { (d, k + 1, true) };
-            }
-            let a = rz / curv;
-            for i in 0..n {
-                d[i] += a * p[i];
-                r[i] -= a * hp[i];
-            }
-            if dot(&r, &r).sqrt() <= tol {
-                return (d, k + 1, true);
-            }
-            z.copy_from_slice(&r);
-            spd.apply_inverse(&mut z, pc);
-            let rz2 = dot(&r, &z);
-            let b = rz2 / rz;
-            rz = rz2;
-            for i in 0..n {
-                p[i] = z[i] + b * p[i];
-            }
-        }
-        (d, self.pcg_max, false)
-    }
-
-    /// y = H x for the assembled lower-triangle block values.
-    fn hess_mul(&self, vals: &[f64], x: &[f64], y: &mut [f64]) {
-        const LOWER: [(usize, usize); 6] = [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)];
-        let pat = self.pattern.as_ref().unwrap();
-        y.fill(0.0);
-        for (q, &key) in pat.pairs.iter().enumerate() {
-            let (a, b) = (3 * (key >> 32) as usize, 3 * (key & 0xffff_ffff) as usize);
-            let o = pat.offset[q] as usize;
-            if a == b {
-                for (k, &(i, j)) in LOWER.iter().enumerate() {
-                    let v = vals[o + k];
-                    y[a + i] += v * x[a + j];
-                    if i != j {
-                        y[a + j] += v * x[a + i];
-                    }
-                }
-            } else {
-                for i in 0..3 {
-                    for j in 0..3 {
-                        let v = vals[o + 3 * i + j];
-                        y[a + i] += v * x[b + j];
-                        y[b + j] += v * x[a + i];
-                    }
-                }
-            }
-        }
     }
 
     fn assemble(&self, grad: &mut [f64], vals: &mut [f64], project: bool) {

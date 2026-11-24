@@ -514,18 +514,23 @@ impl App {
         let triangles: &[[u32; 3]];
         let (speed, exit): (&[f32], &[f32]);
         let kf_index: usize;
+        // Time of the shown frame while the piece is still attached; None
+        // for the cut piece, which is all pasta.
+        let frame_time: Option<f64>;
         let progress;
         let result = self.piece.as_ref().filter(|s| s.0 == self.grow_gen || !self.grow_running());
         if let Some(s) = result {
             let r = &s.1;
             key = s.0;
             kf_index = self.timeline.unwrap_or(r.keyframes.len().saturating_sub(1)).min(r.keyframes.len().saturating_sub(1));
-            (positions, triangles) = match self.shape_view {
-                ShapeView::Hanging => (Arc::new(r.hanging.clone()), &r.piece_surface[..]),
-                ShapeView::Relaxed => (Arc::new(r.relaxed.clone().unwrap_or_else(|| r.hanging.clone())), &r.piece_surface[..]),
+            (positions, triangles, frame_time) = match self.shape_view {
+                ShapeView::Hanging => (Arc::new(r.hanging.clone()), &r.piece_surface[..], None),
+                ShapeView::Relaxed => {
+                    (Arc::new(r.relaxed.clone().unwrap_or_else(|| r.hanging.clone())), &r.piece_surface[..], None)
+                }
                 ShapeView::Timeline => {
                     let kf = &r.keyframes[kf_index];
-                    (kf.positions.clone(), &r.surface[..kf.triangles.min(r.surface.len())])
+                    (kf.positions.clone(), &r.surface[..kf.triangles.min(r.surface.len())], Some(kf.time))
                 }
             };
             (speed, exit) = (&r.speed_at_node, &r.exit_time);
@@ -535,6 +540,7 @@ impl App {
             kf_index = progress.snapshot.stats.rows;
             positions = progress.snapshot.keyframe.positions.clone();
             triangles = &progress.snapshot.surface[..];
+            frame_time = Some(progress.snapshot.time);
             (speed, exit) = (&progress.snapshot.speed_at_node[..], &progress.snapshot.exit_time[..]);
         } else {
             return;
@@ -544,8 +550,14 @@ impl App {
             return;
         }
         self.shown = Some(token);
-        // Only what has left the die (z <= 0) is pasta.
-        let outside = |i: u32| positions.get(i as usize).map(|p| p[2] <= 1e-4).unwrap_or(false);
+        // Only material that has left the die is pasta. Decide by when it
+        // left, not where it is: exited dough can sit behind the die plane
+        // (pressed into the face, curled back, or relaxed after the cut),
+        // and testing its position there cut holes in the surface.
+        let outside = |i: u32| {
+            i < positions.len() as u32
+                && frame_time.is_none_or(|t| exit.get(i as usize).is_some_and(|&e| e as f64 <= t + 1e-9))
+        };
         let mut indices = Vec::with_capacity(triangles.len() * 3);
         for t in triangles {
             if t.iter().all(|&i| outside(i)) {

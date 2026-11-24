@@ -54,7 +54,7 @@ Sweep parameters: `n k tau_y beta m no_slip output pressure swell ruffle_c young
 | Growing solid | `pasta-solid` | The opening is meshed with one or more quadratic triangles across its thinnest part and every point takes its exit speed from the die flow. For slots that speed is averaged across the gap (keeping its tilt from wall to wall, which bends the sheet) and along the slot over one gap, since the slow skin at the walls is pulled along by the core just past the exit; this also lets dough that sticks to the walls grow. Polygon openings use the point speeds. Rows are the material that crosses the die face at the same moment; each layer of prisms between two rows is split into three quadratic tets (side diagonals chosen by node number, so neighbours match), with the die's kinematics at mid-layer as rest shape, so fast points carry more length. Compressible neo-Hookean material, consistent gravity loads, inertia, contact with the die face and a support surface. Implicit steps solved by Newton with the exact Hessian (shifted when indefinite) and sparse Cholesky. |
 | Growing shell (previous model) | `pasta-shell` | Triangle mesh grown one row per die push. St Venant–Kirchhoff stretching per triangle; bending from a per-face shape operator built from hinge angles; gravity; contact with the die face and a support surface. Material inside the die takes the die's shape as its rest shape and freezes when it exits, so faster stations carry more length. Implicit steps solved by damped Newton with sparse Cholesky. |
 | Pipeline | `pasta-sim` | Project files, background jobs (latest edit wins, cancellable), sweeps, exports. |
-| Shared | `pasta-linalg` | Sparse SPD solves on a fixed pattern with reused workspace; a seeded random generator. |
+| Shared | `pasta-linalg` | Sparse SPD solves on a fixed pattern with reused workspace (faer's ordering and symbolic analysis). With several threads the numeric factorisation works on independent branches of the elimination tree at the same time, which faer does not; a seeded random generator. |
 | Front ends | `pasta-cli`, `pasta-app` | Command line; egui app with its own wgpu viewport. |
 
 Units: mm, s, kPa (die flow) and N, mm (pasta).
@@ -108,12 +108,13 @@ What the die design taught: with the default wall slip the dough moves almost as
 | Reduction and readouts | 0.013 ms | under 2 ms |
 | Sweep of 1,000 die solves | 4.7 s | under 30 s |
 | Solid, 12 mm ribbon, 54 section triangles × 72 rows (67k unknowns) | 142 s | |
-| Solid, 20 mm ribbon, 90 triangles × 110 rows (176k unknowns) | 503 s | |
+| Solid, 20 mm ribbon, 90 triangles × 110 rows (176k unknowns) | 503 s (before the speed-ups below) | |
+| Solid, 20 mm ribbon with fast edges, 36 elements across, 40 mm (85k unknowns), 8 threads | 108 s (was 196 s) | |
 | Shell, 32 stations × 60 rows | 14 to 22 s | |
 | Shell, 64 stations × 120 rows | 283 s | |
 | Shell, 48 stations × 150 rows (ruffled die, 76 mm) | about 100 s including relaxation | preview under 20 s at 64 × 200 — **missed** |
 
-Both models spend over 90% of their time in sparse factorisation. The solid needs 5 to 8 Newton iterations per row; about one in twenty systems is indefinite while the piece buckles and is solved with projected material tangents instead. Run long jobs one at a time: several at once oversubscribe the cores. The planned "frozen tail" (rows far from the die treated as rigid) is the next step for speed.
+Both models spend over 90% of their time in sparse factorisation. Speed tests on the 85k-unknown ribbon: faer's threads only work inside dense blocks and made it 13% slower than one thread; keeping no spare rows in the pattern saves 17%; factorising independent branches of the elimination tree in parallel gives 1.43× at 8 threads (the tree's longest chain allows at most 1.9×; 16 threads add nothing); together 1.8×. Reusing a factorisation as a conjugate-gradient preconditioner lost (about 12 iterations per Newton step cost as much as the factorisations saved). Element assembly and the line search take about 6%, so hand-written SIMD there would not pay. The solid needs 5 to 8 Newton iterations per row; about one in twenty systems is indefinite while the piece buckles and is solved with projected material tangents instead. Run long jobs one at a time: several at once oversubscribe the cores. The planned "frozen tail" (rows far from the die treated as rigid) is the next step for speed.
 
 ## Known limitations
 

@@ -6,6 +6,12 @@
 //! (fill-reducing ordering and symbolic Cholesky) and then factorises any
 //! number of value vectors given in the same order. Duplicate entries are
 //! summed.
+//!
+//! With more than one thread, the numeric factorisation works on
+//! independent branches of the elimination tree at the same time
+//! ([`tree`]); faer's own factorisation visits the supernodes in order and
+//! only threads inside each dense block, which is slower than one thread on
+//! the long, thin pasta meshes. Solves are sequential for the same reason.
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::cholesky::llt::factor::LltRegularization;
@@ -17,7 +23,7 @@ pub use faer::Par;
 
 mod tree;
 
-/// Parallelism to use for one factorisation.
+/// Threads to use for one factorisation.
 pub fn par(threads: usize) -> Par {
     if threads <= 1 { Par::Seq } else { Par::rayon(threads) }
 }
@@ -54,8 +60,8 @@ pub struct SpdPattern {
     workspace: std::sync::Mutex<Option<Work>>,
     /// Numeric factorisations attempted so far, including failed ones.
     factorisations: std::sync::atomic::AtomicUsize,
-    /// EXPERIMENT: tree-parallel numeric factorisation (None if faer chose
-    /// a simplicial factor).
+    /// Tree-parallel numeric factorisation (None if faer chose a simplicial
+    /// factor).
     tree: Option<tree::TreeFactor>,
 }
 
@@ -83,7 +89,17 @@ impl SpdPattern {
         let chol = factorize_symbolic_cholesky(sym.as_ref(), Side::Lower, Default::default(), Default::default())
             .map_err(|e| SolveError::Build(format!("{e:?}")))?;
         let tree = tree::TreeFactor::new(n, entries, &chol);
-        Ok(Self { n, nnz_in: entries.len(), sym, argsort, chol, diag_entry, workspace: std::sync::Mutex::new(None), factorisations: Default::default(), tree })
+        Ok(Self {
+            n,
+            nnz_in: entries.len(),
+            sym,
+            argsort,
+            chol,
+            diag_entry,
+            workspace: std::sync::Mutex::new(None),
+            factorisations: Default::default(),
+            tree,
+        })
     }
 
     pub fn n(&self) -> usize {
@@ -108,7 +124,7 @@ impl SpdPattern {
         if !self.factorize(values, par)? {
             return Ok(false);
         }
-        self.apply_inverse(rhs, par);
+        self.apply_inverse(rhs);
         Ok(true)
     }
 
@@ -119,7 +135,7 @@ impl SpdPattern {
     /// Shifts grow fourfold per attempt.
     pub fn solve_from(&self, values: &[f64], rhs: &mut [f64], par: Par, first_shift: f64) -> Result<f64, SolveError> {
         let shift = self.factorize_from(values, par, first_shift)?;
-        self.apply_inverse(rhs, par);
+        self.apply_inverse(rhs);
         Ok(shift)
     }
 
@@ -129,13 +145,11 @@ impl SpdPattern {
     pub fn factorize(&self, values: &[f64], par: Par) -> Result<bool, SolveError> {
         assert_eq!(values.len(), self.nnz_in);
         self.factorisations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut guard = self.work(par);
+        let mut guard = self.work();
         let w = guard.as_mut().unwrap();
         w.valid = false;
-        if let (Some(t), Ok(threads)) = (&self.tree, std::env::var("PASTA_TREE_THREADS")) {
-            // EXPERIMENT
-            let threads: usize = threads.parse().unwrap_or(8);
-            let ok = t.factorize(values, &mut w.lval, threads);
+        if let (Some(t), Par::Rayon(threads)) = (&self.tree, par) {
+            let ok = t.factorize(values, &mut w.lval, threads.get());
             w.valid = ok;
             return Ok(ok);
         }
@@ -148,7 +162,7 @@ impl SpdPattern {
                 a.as_ref(),
                 Side::Lower,
                 LltRegularization::default(),
-                par,
+                Par::Seq,
                 MemStack::new(&mut w.buf),
                 Default::default(),
             )
@@ -188,103 +202,31 @@ impl SpdPattern {
         Err(SolveError::NotPositiveDefinite)
     }
 
-    /// EXPERIMENT: supernodes, total flops, and flops on the most expensive
-    /// leaf-to-root path of the supernodal elimination tree (left-looking:
-    /// each supernode's updates are counted where they are pulled in).
-    pub fn tree_profile(&self) -> Option<(usize, f64, f64, usize)> {
-        use faer::sparse::linalg::cholesky::SymbolicCholeskyRaw;
-        let SymbolicCholeskyRaw::Supernodal(sym) = self.chol.raw() else { return None };
-        let ns = sym.n_supernodes();
-        let begin: Vec<usize> = sym.supernode_begin().to_vec();
-        let end: Vec<usize> = sym.supernode_end().to_vec();
-        let mut owner = vec![0usize; self.n];
-        for s in 0..ns {
-            for c in begin[s]..end[s] {
-                owner[c] = s;
-            }
-        }
-        let mut work = vec![0.0f64; ns];
-        let mut parent = vec![usize::MAX; ns];
-        for d in 0..ns {
-            let pat: Vec<usize> = sym.supernode(d).pattern().to_vec();
-            let c = (end[d] - begin[d]) as f64;
-            let r = pat.len() as f64;
-            work[d] += c * c * c / 3.0 + r * c * c;
-            if let Some(&first) = pat.first() {
-                parent[d] = owner[first];
-            }
-            // Pulls into each ancestor s: rows of d inside s (mid) and at or below s (bot).
-            let mut i = 0;
-            while i < pat.len() {
-                let s = owner[pat[i]];
-                let mut j = i;
-                while j < pat.len() && owner[pat[j]] == s {
-                    j += 1;
-                }
-                let mid = (j - i) as f64;
-                let bot = (pat.len() - i) as f64;
-                work[s] += 2.0 * c * (bot - 0.5 * mid) * mid;
-                i = j;
-            }
-        }
-        let total: f64 = work.iter().sum();
-        // Children come before parents, so one forward pass gives path costs.
-        let mut path = work.clone();
-        let mut best = 0.0f64;
-        let mut roots = 0;
-        for s in 0..ns {
-            if parent[s] == usize::MAX {
-                roots += 1;
-                best = best.max(path[s]);
-            } else {
-                let p = parent[s];
-                let cand = path[s] + work[p];
-                if cand > path[p] {
-                    path[p] = cand;
-                }
-            }
-        }
-        Some((ns, total, best, roots))
-    }
-
     /// Numeric factorisations attempted so far, including failed ones.
     pub fn factorisations(&self) -> usize {
         self.factorisations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether a factor from [`SpdPattern::factorize`] is kept.
-    pub fn has_factor(&self) -> bool {
-        self.workspace.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|w| w.valid)
-    }
-
     /// Replaces rhs by A⁻¹ rhs using the kept factor. Panics if there is none.
-    pub fn apply_inverse(&self, rhs: &mut [f64], par: Par) {
+    pub fn apply_inverse(&self, rhs: &mut [f64]) {
         assert_eq!(rhs.len(), self.n);
-        let mut guard = self.work(par);
+        let mut guard = self.work();
         let w = guard.as_mut().unwrap();
         assert!(w.valid, "no factor kept");
         let llt = LltRef::<'_, usize, f64>::new(&self.chol, &w.lval);
         let rhs_mat = MatMut::from_column_major_slice_mut(rhs, self.n, 1);
-        llt.solve_in_place_with_conj(Conj::No, rhs_mat, par, MemStack::new(&mut w.buf));
+        llt.solve_in_place_with_conj(Conj::No, rhs_mat, Par::Seq, MemStack::new(&mut w.buf));
     }
 
-    /// The workspace, with scratch sized for `par` (a kept factor survives a
-    /// change of `par`).
-    fn work(&self, par: Par) -> std::sync::MutexGuard<'_, Option<Work>> {
+    /// The workspace, allocated on first use.
+    fn work(&self) -> std::sync::MutexGuard<'_, Option<Work>> {
         let mut guard = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.as_ref().is_none_or(|w| w.par != par) {
+        if guard.is_none() {
             let req = self
                 .chol
-                .factorize_numeric_llt_scratch::<f64>(par, Default::default())
-                .or(self.chol.solve_in_place_scratch::<f64>(1, par));
-            let buf = MemBuffer::new(req);
-            match guard.as_mut() {
-                Some(w) => {
-                    w.buf = buf;
-                    w.par = par;
-                }
-                None => *guard = Some(Work { lval: vec![0.0f64; self.chol.len_val()], buf, par, valid: false }),
-            }
+                .factorize_numeric_llt_scratch::<f64>(Par::Seq, Default::default())
+                .or(self.chol.solve_in_place_scratch::<f64>(1, Par::Seq));
+            *guard = Some(Work { lval: vec![0.0f64; self.chol.len_val()], buf: MemBuffer::new(req), valid: false });
         }
         guard
     }
@@ -294,7 +236,6 @@ struct Work {
     /// Factor values (faer overwrites them completely on each factorisation).
     lval: Vec<f64>,
     buf: MemBuffer,
-    par: Par,
     /// Whether `lval` holds a complete factor.
     valid: bool,
 }
@@ -418,7 +359,7 @@ mod tests {
         tree.factorize(&v, &mut l, 4);
         p.workspace.lock().unwrap().as_mut().unwrap().lval = l;
         let mut x = vec![1.0; n];
-        p.apply_inverse(&mut x, Par::Seq);
+        p.apply_inverse(&mut x);
         let mut ax = vec![0.0; n];
         for (k, &(r, c)) in e.iter().enumerate() {
             ax[r] += v[k] * x[c];
